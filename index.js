@@ -34,7 +34,7 @@ function run(query, params = []) {
         reject(err);
         return;
       }
-      resolve(rows); 
+      resolve(rows);
     });
   });
 }
@@ -63,7 +63,7 @@ function runStatement(query, params = []) {
   });
 }
 
-function paginate(items, page = 1, perPage = 6) {
+function paginate(items, page = 1, perPage = 6, basePath = "/blog") {
   const pageNumber = Number(page) > 0 ? Number(page) : 1;
   const total = items.length;
   const totalPages = Math.max(1, Math.ceil(total / perPage));
@@ -77,8 +77,40 @@ function paginate(items, page = 1, perPage = 6) {
     total,
     per_page: perPage,
     next_page_url:
-      pageNumber < totalPages ? `/blog?page=${pageNumber + 1}` : null,
-    prev_page_url: pageNumber > 1 ? `/blog?page=${pageNumber - 1}` : null,
+      pageNumber < totalPages ? `${basePath}?page=${pageNumber + 1}` : null,
+    prev_page_url: pageNumber > 1 ? `${basePath}?page=${pageNumber - 1}` : null,
+  };
+}
+
+function parseJsonArray(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function mapProductRow(product, categoryOverride = null) {
+  const category = categoryOverride || {
+    id: product.category_id,
+    name: product.category_name,
+    slug: product.category_slug,
+  };
+
+  return {
+    id: product.id,
+    slug: product.slug,
+    title: product.title,
+    description: product.description,
+    image: product.image,
+    sku: product.sku,
+    price: Number(product.price || 0),
+    tags: parseJsonArray(product.tags),
+    category: category && category.name ? category : null,
+    published_at: product.created_at,
   };
 }
 
@@ -320,6 +352,436 @@ app.get("/api/categories/:slug/blog", async (req, res) => {
       .json({ message: "Database error", error: error.message });
   }
 });
+
+app.get("/api/products", async (req, res) => {
+  try {
+    const page = Number(req.query.page || 1);
+    const rows = await run(`
+      SELECT p.*, c.name AS category_name, c.slug AS category_slug
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      WHERE p.status = 'published'
+      ORDER BY p.created_at DESC
+    `);
+
+    const items = rows.map((product) => mapProductRow(product));
+    const perPage = 12;
+    const totalPages = Math.max(1, Math.ceil(items.length / perPage));
+    const currentPage = Number.isFinite(page) && page > 0 ? page : 1;
+    const safePage = Math.min(currentPage, totalPages);
+    const start = (safePage - 1) * perPage;
+    const end = start + perPage;
+
+    return res.json({
+      data: items.slice(start, end),
+      current_page: safePage,
+      last_page: totalPages,
+      total: items.length,
+      per_page: perPage,
+      next_page_url:
+        safePage < totalPages ? `/api/products?page=${safePage + 1}` : null,
+      prev_page_url: safePage > 1 ? `/api/products?page=${safePage - 1}` : null,
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: "Database error", error: error.message });
+  }
+});
+
+app.get("/api/products/:slug", async (req, res) => {
+  try {
+    const row = await runOne(
+      `
+      SELECT p.*, c.name AS category_name, c.slug AS category_slug
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      WHERE p.slug = ? AND p.status = 'published'
+      LIMIT 1
+    `,
+      [req.params.slug],
+    );
+
+    if (!row) {
+      return res.status(404).json({ message: "Product not found" });
+    }
+
+    return res.json({
+      id: row.id,
+      title: row.title,
+      slug: row.slug,
+      description: row.description,
+      image: row.image,
+      sku: row.sku,
+      price: Number(row.price || 0),
+      tags: parseJsonArray(row.tags),
+      custom_fields: parseJsonArray(row.custom_fields),
+      variations: parseJsonArray(row.variations),
+      category: row.category_name
+        ? {
+            id: row.category_id,
+            name: row.category_name,
+            slug: row.category_slug,
+          }
+        : null,
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: "Database error", error: error.message });
+  }
+});
+
+app.get("/api/products/category/:slug", async (req, res) => {
+  try {
+    const category = await runOne(
+      "SELECT id, name, slug FROM categories WHERE slug = ? LIMIT 1",
+      [req.params.slug],
+    );
+
+    if (!category) {
+      return res.status(404).json({ message: "Category not found" });
+    }
+
+    const rows = await run(
+      `
+      SELECT p.*, c.name AS category_name, c.slug AS category_slug
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      WHERE p.category_id = ? AND p.status = 'published'
+      ORDER BY p.created_at DESC
+    `,
+      [category.id],
+    );
+
+    const items = rows.map((product) => mapProductRow(product, category));
+    const page = Number(req.query.page || 1);
+    const perPage = 12;
+    const totalPages = Math.max(1, Math.ceil(items.length / perPage));
+    const currentPage = Number.isFinite(page) && page > 0 ? page : 1;
+    const safePage = Math.min(currentPage, totalPages);
+    const start = (safePage - 1) * perPage;
+    const end = start + perPage;
+
+    return res.json({
+      category,
+      data: items.slice(start, end),
+      current_page: safePage,
+      last_page: totalPages,
+      total: items.length,
+      per_page: perPage,
+      next_page_url:
+        safePage < totalPages
+          ? `/api/products/category/${category.slug}?page=${safePage + 1}`
+          : null,
+      prev_page_url:
+        safePage > 1
+          ? `/api/products/category/${category.slug}?page=${safePage - 1}`
+          : null,
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: "Database error", error: error.message });
+  }
+});
+
+app.get("/api/products/tag/:tag", async (req, res) => {
+  try {
+    const targetTag = String(req.params.tag || "")
+      .trim()
+      .toLowerCase();
+    const rows = await run(`
+      SELECT p.*, c.name AS category_name, c.slug AS category_slug
+      FROM products p
+      LEFT JOIN categories c ON c.id = p.category_id
+      WHERE p.status = 'published'
+      ORDER BY p.created_at DESC
+    `);
+
+    const filtered = rows.filter((product) => {
+      const tags = parseJsonArray(product.tags).map((tag) =>
+        String(tag).trim().toLowerCase(),
+      );
+      return tags.includes(targetTag);
+    });
+
+    const items = filtered.map((product) => mapProductRow(product));
+    const page = Number(req.query.page || 1);
+    const perPage = 12;
+    const totalPages = Math.max(1, Math.ceil(items.length / perPage));
+    const currentPage = Number.isFinite(page) && page > 0 ? page : 1;
+    const safePage = Math.min(currentPage, totalPages);
+    const start = (safePage - 1) * perPage;
+    const end = start + perPage;
+
+    return res.json({
+      tag: req.params.tag,
+      data: items.slice(start, end),
+      current_page: safePage,
+      last_page: totalPages,
+      total: items.length,
+      per_page: perPage,
+      next_page_url:
+        safePage < totalPages
+          ? `/api/products/tag/${encodeURIComponent(req.params.tag)}?page=${safePage + 1}`
+          : null,
+      prev_page_url:
+        safePage > 1
+          ? `/api/products/tag/${encodeURIComponent(req.params.tag)}?page=${safePage - 1}`
+          : null,
+    });
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: "Database error", error: error.message });
+  }
+});
+
+app.get("/api/product-categories", async (req, res) => {
+  try {
+    const rows = await run(
+      "SELECT id, name, slug FROM categories ORDER BY name ASC",
+    );
+    return res.json(rows);
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: "Database error", error: error.message });
+  }
+});
+
+app.get("/api/product-tags", async (req, res) => {
+  try {
+    const rows = await run(
+      "SELECT tags FROM products WHERE status = 'published'",
+    );
+    const values = rows.flatMap((row) => parseJsonArray(row.tags));
+    const unique = [...new Set(values.map((tag) => String(tag).trim()))].filter(
+      Boolean,
+    );
+    return res.json(unique);
+  } catch (error) {
+    return res
+      .status(500)
+      .json({ message: "Database error", error: error.message });
+  }
+});
+
+app.get(
+  "/api/products-admin",
+  authenticateToken,
+  requireRole("admin", "editor"),
+  async (req, res) => {
+    try {
+      const rows = await run(`
+        SELECT p.*, c.name AS category_name, c.slug AS category_slug
+        FROM products p
+        LEFT JOIN categories c ON c.id = p.category_id
+        ORDER BY p.id DESC
+      `);
+
+      return res.json(
+        rows.map((product) => ({
+          id: product.id,
+          title: product.title,
+          slug: product.slug,
+          sku: product.sku,
+          price: Number(product.price || 0),
+          status: product.status,
+          image: product.image,
+          category: product.category_name
+            ? {
+                id: product.category_id,
+                name: product.category_name,
+                slug: product.category_slug,
+              }
+            : null,
+          tags: parseJsonArray(product.tags),
+          custom_fields: parseJsonArray(product.custom_fields),
+          variations: parseJsonArray(product.variations),
+          created_at: product.created_at,
+        })),
+      );
+    } catch (error) {
+      return res
+        .status(500)
+        .json({ message: "Database error", error: error.message });
+    }
+  },
+);
+
+app.post(
+  "/api/products-admin",
+  authenticateToken,
+  requireRole("admin", "editor"),
+  async (req, res) => {
+    try {
+      const {
+        title,
+        slug,
+        description,
+        image,
+        sku,
+        price,
+        category_id,
+        tags,
+        custom_fields,
+        variations,
+        status,
+      } = req.body || {};
+
+      if (!title || !slug || !sku || price === undefined || price === null) {
+        return res.status(400).json({
+          message: "Title, slug, sku and price are required",
+        });
+      }
+
+      const existingSlug = await runOne(
+        "SELECT id FROM products WHERE slug = ?",
+        [slug],
+      );
+      if (existingSlug) {
+        return res.status(409).json({ message: "Slug already exists" });
+      }
+
+      const existingSku = await runOne(
+        "SELECT id FROM products WHERE sku = ?",
+        [sku],
+      );
+      if (existingSku) {
+        return res.status(409).json({ message: "SKU already exists" });
+      }
+
+      const result = await runStatement(
+        'INSERT INTO products (user_id, category_id, title, slug, description, image, sku, price, tags, custom_fields, variations, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now"), datetime("now"))',
+        [
+          req.user.id,
+          category_id || null,
+          title,
+          slug,
+          description || null,
+          image || null,
+          sku,
+          Number(price),
+          tags ? JSON.stringify(tags) : null,
+          custom_fields ? JSON.stringify(custom_fields) : null,
+          variations ? JSON.stringify(variations) : null,
+          status || "draft",
+        ],
+      );
+
+      const product = await runOne("SELECT * FROM products WHERE id = ?", [
+        result.id,
+      ]);
+      return res.status(201).json(product);
+    } catch (error) {
+      return res
+        .status(500)
+        .json({ message: "Database error", error: error.message });
+    }
+  },
+);
+
+app.put(
+  "/api/products-admin/:product",
+  authenticateToken,
+  requireRole("admin", "editor"),
+  async (req, res) => {
+    try {
+      const current = await runOne("SELECT * FROM products WHERE id = ?", [
+        req.params.product,
+      ]);
+      if (!current) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+
+      const {
+        title,
+        slug,
+        description,
+        image,
+        sku,
+        price,
+        category_id,
+        tags,
+        custom_fields,
+        variations,
+        status,
+      } = req.body || {};
+
+      const nextSlug = slug || current.slug;
+      const slugExists = await runOne(
+        "SELECT id FROM products WHERE slug = ? AND id != ?",
+        [nextSlug, current.id],
+      );
+      if (slugExists) {
+        return res.status(409).json({ message: "Slug already exists" });
+      }
+
+      const nextSku = sku || current.sku;
+      const skuExists = await runOne(
+        "SELECT id FROM products WHERE sku = ? AND id != ?",
+        [nextSku, current.id],
+      );
+      if (skuExists) {
+        return res.status(409).json({ message: "SKU already exists" });
+      }
+
+      await runStatement(
+        `UPDATE products SET category_id = ?, title = ?, slug = ?, description = ?, image = ?, sku = ?, price = ?, tags = ?, custom_fields = ?, variations = ?, status = ?, updated_at = datetime("now") WHERE id = ?`,
+        [
+          category_id ?? current.category_id,
+          title || current.title,
+          nextSlug,
+          description ?? current.description,
+          image ?? current.image,
+          nextSku,
+          Number(price ?? current.price),
+          tags ? JSON.stringify(tags) : current.tags,
+          custom_fields ? JSON.stringify(custom_fields) : current.custom_fields,
+          variations ? JSON.stringify(variations) : current.variations,
+          status || current.status,
+          current.id,
+        ],
+      );
+
+      const product = await runOne("SELECT * FROM products WHERE id = ?", [
+        current.id,
+      ]);
+      return res.json(product);
+    } catch (error) {
+      return res
+        .status(500)
+        .json({ message: "Database error", error: error.message });
+    }
+  },
+);
+
+app.delete(
+  "/api/products-admin/:product",
+  authenticateToken,
+  requireRole("admin"),
+  async (req, res) => {
+    try {
+      const current = await runOne("SELECT * FROM products WHERE id = ?", [
+        req.params.product,
+      ]);
+      if (!current) {
+        return res.status(404).json({ message: "Product not found" });
+      }
+
+      await runStatement("DELETE FROM products WHERE id = ?", [
+        req.params.product,
+      ]);
+      return res.json({ message: "Product deleted successfully" });
+    } catch (error) {
+      return res
+        .status(500)
+        .json({ message: "Database error", error: error.message });
+    }
+  },
+);
 
 app.post("/api/register", async (req, res) => {
   try {
